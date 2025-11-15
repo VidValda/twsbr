@@ -27,7 +27,6 @@ params = struct('d', d, 'l', l, 'r', r, 'mb', mb, 'mw', mw, ...
                 'calpha', calpha, 'g', g, 'theta_limit', theta_limit);
 
 %% NMPC Controller Setup
-fprintf('\n--- Setting up NMPC Controller ---\n');
 
 % Create NMPC object
 nx = 6;  % Number of states: [x, θ, ψ, dx, dθ, dψ]
@@ -90,6 +89,27 @@ mpc_params = struct('d', d+d*0.1, 'l', l+0.1*l, 'r', r-0.1*r, 'mb', mb + 0.1*mb,
                 'J', J+0.1*J, 'K', K-0.1*K, 'I1', I1+0.1*I1, 'I2', I2-0.1*I2, 'I3', I3+0.1*I3, ...
                 'calpha', calpha+0.1*calpha, 'g', g+0.1*g, 'theta_limit', theta_limit);
 
+%% Measurement noise setup
+fprintf('\n--- Measurement Noise Setup ---\n');
+
+% Define noise standard deviations for each state
+noise_std = [
+    0.01,   % x position noise (m)
+    0.005,  % θ pitch noise (rad) ~0.3°
+    0.005,  % ψ yaw noise (rad) ~0.3°
+    0.02,   % dx velocity noise (m/s)
+    0.01,   % dθ pitch rate noise (rad/s)
+    0.01    % dψ yaw rate noise (rad/s)
+];
+
+fprintf('Measurement noise (1-sigma):\n');
+fprintf('  Position: %.3f m\n', noise_std(1));
+fprintf('  Pitch angle: %.3f rad (%.2f deg)\n', noise_std(2), rad2deg(noise_std(2)));
+fprintf('  Yaw angle: %.3f rad (%.2f deg)\n', noise_std(3), rad2deg(noise_std(3)));
+fprintf('  Linear velocity: %.3f m/s\n', noise_std(4));
+fprintf('  Pitch rate: %.3f rad/s (%.2f deg/s)\n', noise_std(5), rad2deg(noise_std(5)));
+fprintf('  Yaw rate: %.3f rad/s (%.2f deg/s)\n', noise_std(6), rad2deg(noise_std(6)));
+
 %% Define prediction model (nonlinear dynamics)
 nlobj.Model.StateFcn = @(x, u) segway_discrete_dynamics(x, u, Ts, mpc_params);
 nlobj.Model.IsContinuousTime = false;
@@ -98,17 +118,15 @@ nlobj.Model.IsContinuousTime = false;
 nlobj.Model.OutputFcn = @(x, u) x;  % y = x
 
 %% Define cost function (stage cost)
-% Weights for state tracking
 Q_nmpc = diag([
-    0,    ... x [high - track trajectory]
-    100,     ... θ [moderate - stay upright]
-    100,    ... ψ [high - lock heading at 0°]
-    0,     ... dx [track velocity]
+    0,      ... x [no position tracking]
+    100,    ... θ [high - stay upright]
+    100,    ... ψ [high - lock heading at desired yaw]
+    0,      ... dx [no velocity tracking]
     10,     ... dθ [penalize pitch rate]
     20      ... dψ [penalize yaw drift]
 ]);
 
-% Weights for control effort
 R_nmpc = diag([0.1, 0.1]);
 
 % Set weights
@@ -141,7 +159,6 @@ dpsi0 = 0;       % Initial yaw angular velocity (rad/s)
 
 x_init = [x0; theta0; psi0; dx0; dtheta0; dpsi0];
 
-fprintf('\n--- Initial Conditions ---\n');
 fprintf('Initial position: %.2f m\n', x0);
 fprintf('Initial pitch angle: %.2f deg\n', rad2deg(theta0));
 
@@ -149,44 +166,67 @@ fprintf('Initial pitch angle: %.2f deg\n', rad2deg(theta0));
 t_final = 20;    % Simulation time (seconds)
 N_steps = round(t_final / Ts);
 
+%% Drift model setup (random walk)
+
+drift_std = [
+    0.005,   % x position drift rate (m/√s)
+    0.003,   % θ pitch drift rate (rad/√s)
+    0.003,   % ψ yaw drift rate (rad/√s)
+    0.01,    % dx velocity drift rate (m/s/√s)
+    0.005,   % dθ pitch rate drift rate (rad/s/√s)
+    0.005    % dψ yaw rate drift rate (rad/s/√s)
+];
+
+fprintf('Drift rates (random walk):\n');
+fprintf('  Position: %.4f m/√s\n', drift_std(1));
+fprintf('  Pitch angle: %.4f rad/√s (%.3f deg/√s)\n', drift_std(2), rad2deg(drift_std(2)));
+fprintf('  Yaw angle: %.4f rad/√s (%.3f deg/√s)\n', drift_std(3), rad2deg(drift_std(3)));
+fprintf('  Linear velocity: %.4f m/s/√s\n', drift_std(4));
+fprintf('  Pitch rate: %.4f rad/s/√s (%.3f deg/s/√s)\n', drift_std(5), rad2deg(drift_std(5)));
+fprintf('  Yaw rate: %.4f rad/s/√s (%.3f deg/s/√s)\n', drift_std(6), rad2deg(drift_std(6)));
+
+fprintf('\nExpected drift magnitude after %.0f seconds (3σ):\n', t_final);
+fprintf('  Position: ±%.4f m\n', 3*drift_std(1)*sqrt(t_final));
+fprintf('  Pitch angle: ±%.4f rad (%.2f deg)\n', 3*drift_std(2)*sqrt(t_final), rad2deg(3*drift_std(2)*sqrt(t_final)));
+fprintf('  Yaw angle: ±%.4f rad (%.2f deg)\n', 3*drift_std(3)*sqrt(t_final), rad2deg(3*drift_std(3)*sqrt(t_final)));
+
 % Preallocate arrays
 t_sim = (0:N_steps) * Ts;
 x_hist = zeros(nx, N_steps+1);
+x_measured_hist = zeros(nx, N_steps+1);  % Store noisy measurements
 u_hist = zeros(nu, N_steps);
 
-x_hist(:, 1) = x_init;
+% Initialize drift (random walk) - starts at zero
+drift = zeros(nx, 1);
+drift_hist = zeros(nx, N_steps+1);
 
-%% Define reference trajectory (time-varying)
-% Trajectory options (choose one):
+x_hist(:, 1) = x_init;
+x_measured_hist(:, 1) = x_init;  % Initial measurement (no noise)
+drift_hist(:, 1) = drift;
+
+%% Trajectory selection
 trajectory_type = 'step';  % 'sinusoid', 'step', 'ramp', 'figure8'
 
 switch trajectory_type
     case 'sinusoid'
-        % Sinusoidal trajectory: x(t) = A*sin(omega*t)
-        A_x = 3.0;      % Amplitude (m)
-        omega = 0.3;    % Frequency (rad/s) - slower
+        A_x = 3.0;
+        omega = 0.3;
         x_ref_func = @(t) [A_x*sin(omega*t), 0, 0, A_x*omega*cos(omega*t), 0, 0];
         fprintf('\n--- Reference Trajectory: Sinusoid ---\n');
         fprintf('x(t) = %.1f*sin(%.2f*t)\n', A_x, omega);
         fprintf('Period: %.2f seconds\n', 2*pi/omega);
         fprintf('Max velocity: %.2f m/s\n', A_x*omega);
         fprintf('Max acceleration: %.2f m/s^2\n', A_x*omega^2);
-
     case 'step'
-        % Step trajectory: x jumps at certain times
         x_ref_func = @(t) [(t >= 2)*2.0 + (t >= 5)*(-2.0), 0, 0, 0, 0, 0];
         fprintf('\n--- Reference Trajectory: Steps ---\n');
         fprintf('x(t): 0 → 2 @ t=2s, 2 → 0 @ t=5s\n');
-
     case 'ramp'
-        % Ramp trajectory: constant velocity
         v_ref = 0.5;    % Reference velocity (m/s)
         x_ref_func = @(t) [v_ref*t, 0, 0, v_ref, 0, 0];
         fprintf('\n--- Reference Trajectory: Ramp ---\n');
         fprintf('x(t) = %.2f*t (constant velocity)\n', v_ref);
-
     case 'figure8'
-        % Figure-8 trajectory in X-Y plane (requires yaw control)
         A_x = 2.0;
         A_y = 1.0;
         omega = 0.3;
@@ -212,24 +252,41 @@ set(findall(h_wait, 'Type', 'text'), 'Interpreter', 'none');
 for k = 1:N_steps
     % Update waitbar
     if mod(k, 10) == 0
-        waitbar(k/N_steps, h_wait, sprintf('Running NMPC simulation... %.1f%%', 100*k/N_steps));
+        waitbar(k/N_steps, ...
+            h_wait, ...
+            sprintf('Running NMPC simulation... %.1f%%', ...
+            100*k/N_steps));
     end
 
-    % Current state
-    x_current = x_hist(:, k);
+    % Current ground truth (from simulation)
+    x_true = x_hist(:, k);
+
+    % Update drift (random walk)
+    drift_increment = sqrt(Ts) * drift_std .* randn(nx, 1);
+    drift = drift + drift_increment;
+    drift_hist(:, k) = drift;
+
+    % Add white noise
+    white_noise = noise_std .* randn(nx, 1);
+
+    % Total measurement error = white noise + drift
+    x_measured = x_true + white_noise + drift;
+
+    % Store measured state
+    x_measured_hist(:, k) = x_measured;
 
     % Get current reference from trajectory
     x_ref = x_ref_func(t_sim(k));
     x_ref_hist(:, k) = x_ref';
 
-    % Compute optimal control using NMPC
-    [u_opt, ~] = nlmpcmove(nlobj, x_current, u_prev, x_ref, []);
+    % Compute optimal control with noisy measurements
+    [u_opt, ~] = nlmpcmove(nlobj, x_measured, u_prev, x_ref, []);
 
     % Store control input
     u_hist(:, k) = u_opt;
 
-    % Apply control and simulate one step using full nonlinear dynamics
-    x_next = segway_discrete_dynamics(x_current, u_opt, Ts, params);
+    % Apply control with true state
+    x_next = segway_discrete_dynamics(x_true, u_opt, Ts, params);
 
     % Check for ground contact
     if abs(x_next(2)) > theta_limit
@@ -237,13 +294,15 @@ for k = 1:N_steps
                 t_sim(k+1), rad2deg(x_next(2)));
         % Truncate arrays
         x_hist = x_hist(:, 1:k+1);
+        x_measured_hist = x_measured_hist(:, 1:k+1);
+        drift_hist = drift_hist(:, 1:k+1);
         u_hist = u_hist(:, 1:k);
         x_ref_hist = x_ref_hist(:, 1:k+1);
         t_sim = t_sim(1:k+1);
         break;
     end
 
-    % Store next state
+    % Store next ground truth state
     x_hist(:, k+1) = x_next;
 
     % Update previous control
@@ -256,12 +315,14 @@ fprintf('Simulation completed.\n');
 % Store final reference
 x_ref_hist(:, end) = x_ref_func(t_sim(end))';
 
-% Debug: Check if reference is actually changing
-fprintf('\nDebug - Reference trajectory check:\n');
-fprintf('  Reference at t=0: x_ref = %.4f m\n', x_ref_hist(1, 1));
-fprintf('  Reference at t=5: x_ref = %.4f m\n', x_ref_hist(1, round(5/Ts)));
-fprintf('  Reference at t=10: x_ref = %.4f m\n', x_ref_hist(1, round(10/Ts)));
-fprintf('  Min x_ref: %.4f m, Max x_ref: %.4f m\n', min(x_ref_hist(1,:)), max(x_ref_hist(1,:)));
+% Update final drift
+drift_increment = sqrt(Ts) * drift_std .* randn(nx, 1);
+drift = drift + drift_increment;
+drift_hist(:, end) = drift;
+
+% Store final measurement with white noise + drift
+white_noise = noise_std .* randn(nx, 1);
+x_measured_hist(:, end) = x_hist(:, end) + white_noise + drift;
 
 %% Extract states
 x = x_hist(1, :)';
@@ -276,14 +337,10 @@ t = t_sim';
 x_ref_traj = x_ref_hist(1, :)';
 dx_ref_traj = x_ref_hist(4, :)';
 
-% Wrap yaw angle for plotting (keeps NMPC solver happy, but displays nicely)
+% Wrap yaw angle for plotting
 psi_wrapped = mod(psi + pi, 2*pi) - pi;
 
-%% Compute Z positions (vertical)
-z_cm = r + l*cos(theta);
-z_tip = r + L_body*cos(theta);
-
-%% Compute global X-Y position (use wrapped yaw for consistency)
+%% Compute global X-Y position (use wrapped yaw)
 vx_global = dx .* cos(psi_wrapped);
 vy_global = dx .* sin(psi_wrapped);
 X_global = cumtrapz(t, vx_global);
@@ -294,19 +351,7 @@ figure('Position', [100, 100, 1400, 900], 'Color', 'w');
 set(0, 'DefaultTextInterpreter', 'latex');
 set(0, 'DefaultLegendInterpreter', 'latex');
 
-subplot(3, 3, 1);
-plot(t, x, 'b-', 'LineWidth', 2);
-hold on;
-plot(t, x_ref_traj, 'r--', 'LineWidth', 2);
-hold off;
-xlabel('$t$ [s]', 'FontSize', 14);
-ylabel('$x$ [m]', 'FontSize', 14);
-title('Position Tracking', 'FontSize', 14);
-legend({'$x$ (actual)', '$x_{\mathrm{ref}}$ (desired)'}, 'Location', 'best');
-grid on;
-set(gca, 'FontSize', 12);
-
-subplot(3, 3, 2);
+subplot(2, 3, 1);
 plot(t, rad2deg(theta), 'LineWidth', 2, 'DisplayName', 'Pitch');
 hold on;
 yline(rad2deg(theta_limit), 'r--', 'LineWidth', 1.5, 'DisplayName', 'Ground Contact');
@@ -322,7 +367,7 @@ grid on;
 legend('Location', 'best');
 set(gca, 'FontSize', 12);
 
-subplot(3, 3, 3);
+subplot(2, 3, 2);
 plot(t, rad2deg(psi_wrapped), 'LineWidth', 2);
 xlabel('$t$ [s]', 'FontSize', 14);
 ylabel('$\psi$ [$^\circ$]', 'FontSize', 14);
@@ -330,7 +375,7 @@ title('Yaw Angle (wrapped)', 'FontSize', 14);
 grid on;
 set(gca, 'FontSize', 12);
 
-subplot(3, 3, 4);
+subplot(2, 3, 3);
 plot(t, dx, 'b-', 'LineWidth', 2);
 hold on;
 plot(t, dx_ref_traj, 'r--', 'LineWidth', 2);
@@ -342,7 +387,7 @@ legend({'$\dot{x}$ (actual)', '$\dot{x}_{\mathrm{ref}}$'}, 'Location', 'best');
 grid on;
 set(gca, 'FontSize', 12);
 
-subplot(3, 3, 5);
+subplot(2, 3, 4);
 plot(t, rad2deg(dtheta), 'LineWidth', 2);
 xlabel('$t$ [s]', 'FontSize', 14);
 ylabel('$\dot{\theta}$ [$^\circ$/s]', 'FontSize', 14);
@@ -350,7 +395,7 @@ title('Pitch Angular Velocity', 'FontSize', 14);
 grid on;
 set(gca, 'FontSize', 12);
 
-subplot(3, 3, 6);
+subplot(2, 3, 5);
 plot(t, rad2deg(dpsi), 'LineWidth', 2);
 xlabel('$t$ [s]', 'FontSize', 14);
 ylabel('$\dot{\psi}$ [$^\circ$/s]', 'FontSize', 14);
@@ -358,7 +403,7 @@ title('Yaw Angular Velocity', 'FontSize', 14);
 grid on;
 set(gca, 'FontSize', 12);
 
-subplot(3, 3, 7);
+subplot(2, 3, 6);
 stairs(t(1:end-1), u_hist(1,:), 'b-', 'LineWidth', 2, 'DisplayName', '$\tau_L$ (Left)');
 hold on;
 stairs(t(1:end-1), u_hist(2,:), 'r-', 'LineWidth', 2, 'DisplayName', '$\tau_R$ (Right)');
@@ -372,80 +417,90 @@ legend('Location', 'best');
 grid on;
 set(gca, 'FontSize', 12);
 
-subplot(3, 3, 8);
-plot(t, z_cm, 'b-', 'LineWidth', 2, 'DisplayName', 'Center of Mass');
-hold on;
-plot(t, z_tip, 'r-', 'LineWidth', 2, 'DisplayName', 'Body Tip');
-yline(0, 'k--', 'Ground', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-yline(r, 'g--', 'Wheel Axle', 'LineWidth', 1, 'HandleVisibility', 'off');
-hold off;
-xlabel('$t$ [s]', 'FontSize', 14);
-ylabel('$z$ [m]', 'FontSize', 14);
-title('Vertical Position', 'FontSize', 14);
-legend('Location', 'best');
-grid on;
-set(gca, 'FontSize', 12);
-
-subplot(3, 3, 9);
-plot(X_global, Y_global, 'b-', 'LineWidth', 2, 'DisplayName', 'Trajectory');
-hold on;
-plot(X_global(1), Y_global(1), 'go', 'MarkerSize', 10, 'LineWidth', 2, 'DisplayName', 'Start');
-plot(X_global(end), Y_global(end), 'ro', 'MarkerSize', 10, 'LineWidth', 2, 'DisplayName', 'End');
-hold off;
-xlabel('$X$ (Global) [m]', 'FontSize', 14);
-ylabel('$Y$ (Global) [m]', 'FontSize', 14);
-title('Top View (Global Frame)', 'FontSize', 14);
-legend('Location', 'best');
-grid on;
-axis equal;
-set(gca, 'FontSize', 12);
-
 sgtitle('NMPC-Controlled Two-Wheeled Self-Balancing Robot', 'FontSize', 18, 'FontWeight', 'bold');
 
-%% Performance metrics
-fprintf('\n--- Trajectory Tracking Performance ---\n');
+%% Extract measured states
+x_measured = x_measured_hist(1, :)';
+theta_measured = x_measured_hist(2, :)';
+psi_measured = x_measured_hist(3, :)';
+dx_measured = x_measured_hist(4, :)';
+dtheta_measured = x_measured_hist(5, :)';
+dpsi_measured = x_measured_hist(6, :)';
 
-% Tracking errors
-pos_error = x - x_ref_traj;
-vel_error = dx - dx_ref_traj;
+%% Extract drift components
+drift_x = drift_hist(1, :)';
+drift_theta = drift_hist(2, :)';
 
-fprintf('Position tracking:\n');
-fprintf('  RMS error: %.4f m\n', sqrt(mean(pos_error.^2)));
-fprintf('  Max error: %.4f m\n', max(abs(pos_error)));
-fprintf('  Mean error: %.4f m\n', mean(abs(pos_error)));
+%% Compare white noise vs drift contributions
+figure('Position', [600, 400, 1400, 600], 'Color', 'w');
 
-fprintf('Velocity tracking:\n');
-fprintf('  RMS error: %.4f m/s\n', sqrt(mean(vel_error.^2)));
-fprintf('  Max error: %.4f m/s\n', max(abs(vel_error)));
+% Compute total measurement error components
+total_error = x_measured_hist - x_hist;
+white_noise_component_x = total_error(1, :)' - drift_x;
+white_noise_component_theta = total_error(2, :)' - drift_theta;
 
-fprintf('Control effort:\n');
-fprintf('  Max torque: %.2f Nm\n', max(abs(u_hist(:))));
-fprintf('  Mean torque: %.2f Nm\n', mean(abs(u_hist(:))));
-
-fprintf('Stability:\n');
-fprintf('  Final pitch angle: %.4f deg\n', rad2deg(theta(end)));
-fprintf('  Max pitch angle: %.4f deg\n', rad2deg(max(abs(theta))));
-
-%% Plot tracking error
-figure('Position', [200, 200, 800, 400], 'Color', 'w');
-
-subplot(1, 2, 1);
-plot(t, pos_error, 'LineWidth', 2);
+subplot(2, 2, 1);
+plot(t, total_error(1, :), 'k-', 'LineWidth', 2, 'DisplayName', 'Total Error');
+hold on;
+plot(t, drift_x, 'r-', 'LineWidth', 2, 'DisplayName', 'Drift');
+plot(t, white_noise_component_x, 'b.', 'MarkerSize', 3, 'DisplayName', 'White Noise');
+yline(0, 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
+hold off;
 xlabel('$t$ [s]', 'FontSize', 14);
-ylabel('Position Error [m]', 'FontSize', 14);
-title('Position Tracking Error', 'FontSize', 14);
+ylabel('Error [m]', 'FontSize', 14);
+title('Position Error: White Noise + Drift', 'FontSize', 14);
+legend('Location', 'best');
 grid on;
 set(gca, 'FontSize', 12);
 
-subplot(1, 2, 2);
-plot(t, vel_error, 'LineWidth', 2);
+subplot(2, 2, 2);
+plot(t, rad2deg(total_error(2, :)), 'k-', 'LineWidth', 2, 'DisplayName', 'Total Error');
+hold on;
+plot(t, rad2deg(drift_theta), 'r-', 'LineWidth', 2, 'DisplayName', 'Drift');
+plot(t, rad2deg(white_noise_component_theta), 'b.', 'MarkerSize', 3, 'DisplayName', 'White Noise');
+yline(0, 'k--', 'LineWidth', 1, 'HandleVisibility', 'off');
+hold off;
 xlabel('$t$ [s]', 'FontSize', 14);
-ylabel('Velocity Error [m/s]', 'FontSize', 14);
-title('Velocity Tracking Error', 'FontSize', 14);
+ylabel('Error [$^\circ$]', 'FontSize', 14);
+title('Pitch Angle Error: White Noise + Drift', 'FontSize', 14);
+legend('Location', 'best');
 grid on;
 set(gca, 'FontSize', 12);
 
-% sgtitle(sprintf('Tracking Errors - %s Trajectory', trajectory_type), 'FontSize', 18, 'FontWeight', 'bold');
+subplot(2, 2, 3);
+% Plot standard deviation over time
+window_size = 20;  % Moving window for std calculation
+std_drift_x = movstd(drift_x, window_size);
+std_white_x = movstd(white_noise_component_x, window_size);
+
+plot(t, std_drift_x, 'r-', 'LineWidth', 2, 'DisplayName', 'Drift Std (moving)');
+hold on;
+plot(t, std_white_x, 'b-', 'LineWidth', 2, 'DisplayName', 'White Noise Std (moving)');
+plot(t, noise_std(1)*ones(size(t)), 'b--', 'LineWidth', 1.5, 'DisplayName', 'White Noise $\sigma$ (theory)');
+plot(t, drift_std(1)*sqrt(t), 'r--', 'LineWidth', 1.5, 'DisplayName', 'Drift $\sigma(t)$ (theory)');
+hold off;
+xlabel('$t$ [s]', 'FontSize', 14);
+ylabel('Standard Deviation [m]', 'FontSize', 14);
+title('Position Error Standard Deviation vs Time', 'FontSize', 14);
+legend('Location', 'best');
+grid on;
+set(gca, 'FontSize', 12);
+
+subplot(2, 2, 4);
+final_idx = length(t);
+histogram(white_noise_component_x, 30, 'Normalization', 'pdf', 'DisplayName', 'White Noise', 'FaceAlpha', 0.5);
+hold on;
+x_range = linspace(-4*noise_std(1), 4*noise_std(1), 100);
+plot(x_range, normpdf(x_range, 0, noise_std(1)), 'b-', 'LineWidth', 2, 'DisplayName', 'Theory ($\mathcal{N}(0, \sigma^2)$)');
+hold off;
+xlabel('Error [m]', 'FontSize', 14);
+ylabel('Probability Density', 'FontSize', 14);
+title('White Noise Distribution (Position)', 'FontSize', 14);
+legend('Location', 'best');
+grid on;
+set(gca, 'FontSize', 12);
+
+sgtitle('White Noise vs Drift Comparison', 'FontSize', 18, 'FontWeight', 'bold');
 
 %% Helper function: Discrete-time dynamics
 function x_next = segway_discrete_dynamics(x, u, Ts, params)

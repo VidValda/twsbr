@@ -1,6 +1,3 @@
-% Copy of segway_nmpc.m with global Path Following
-% This version specifies trajectories in the global frame and transforms them
-
 clear; clc; close all;
 
 %% Parameters of the model
@@ -92,7 +89,7 @@ nlobj.Model.OutputFcn = @(x, u) x;
 
 %% Define cost function
 Q_nmpc = diag([
-    0,    ... x [ignore local position]
+    0,      ... x [ignore local position]
     50,     ... θ [moderate - stay reasonably upright]
     500,    ... ψ [VERY HIGH - heading is everything!]
     100,    ... dx [HIGH - velocity tracking]
@@ -123,42 +120,35 @@ trajectory_type = 'figure8';  % 'circle', 'line', 'figure8', 'sine'
 
 switch trajectory_type
     case 'sine'
-        % Sinusoidal trajectory: wave pattern in X-Y plane
-        v_forward = 0.8;   % Forward velocity (m/s)
-        A_wave = 3.0;      % Wave amplitude (m)
-        omega_wave = 0.2;  % Wave frequency (rad/s)
+        v_forward = 0.8;   % Velocity (m/s)
+        A_wave = 3.0;      % Amplitude (m)
+        omega_wave = 0.2;  % Frequency (rad/s)
         X_global_ref = @(t) v_forward * t;
         Y_global_ref = @(t) A_wave * sin(omega_wave * t);
         dX_global_ref = @(t) v_forward;
         dY_global_ref = @(t) A_wave * omega_wave * cos(omega_wave * t);
         fprintf('Sinusoidal trajectory:\n');
         fprintf('  Forward velocity: %.2f m/s\n', v_forward);
-        fprintf('  Wave amplitude: %.1f m\n', A_wave);
-        fprintf('  Wave frequency: %.2f rad/s\n', omega_wave);
+        fprintf('  Amplitude: %.1f m\n', A_wave);
+        fprintf('  Frequency: %.2f rad/s\n', omega_wave);
         fprintf('  Wavelength: %.2f m\n', 2*pi*v_forward/omega_wave);
-
     case 'circle'
-        % Circular trajectory in X-Y plane
-        R_circle = 8.0;    % Radius (m) - larger, easier to track
-        omega = 0.15;      % Angular velocity (rad/s) - slower
+        R_circle = 8.0;    % Radius (m)
+        omega = 0.15;      % Angular velocity (rad/s)
         X_global_ref = @(t) R_circle * cos(omega*t);
         Y_global_ref = @(t) R_circle * sin(omega*t);
         dX_global_ref = @(t) -R_circle * omega * sin(omega*t);
         dY_global_ref = @(t) R_circle * omega * cos(omega*t);
         fprintf('Circular trajectory: R = %.1f m, omega = %.2f rad/s\n', R_circle, omega);
         fprintf('Linear velocity: %.2f m/s\n', R_circle * omega);
-
     case 'line'
-        % Straight line trajectory
         v_line = 0.5;  % Velocity (m/s)
         X_global_ref     = @(t) v_line * t;
         Y_global_ref = @(t) 2.0;  % Constant Y
         dX_global_ref = @(t) v_line;
         dY_global_ref = @(t) 0;
         fprintf('Line trajectory: v = %.2f m/s, Y = %.1f m\n', v_line, 2.0);
-
     case 'figure8'
-        % Figure-8 (lemniscate)
         A = 3.0;
         omega = 0.3;
         X_global_ref = @(t) A * sin(omega*t);
@@ -168,9 +158,9 @@ switch trajectory_type
         fprintf('Figure-8 trajectory: A = %.1f m\n', A);
 end
 
-%% Initial conditions (trajectory dependent)
+%% Initial conditions
 x0 = 0;
-theta0 = 0.05;   % Small perturbation
+theta0 = 0.05;
 dx0 = 0;
 dtheta0 = 0;
 dpsi0 = 0;
@@ -204,7 +194,6 @@ fprintf('Initial heading: %.2f deg\n', rad2deg(psi0));
 t_final = 30;
 N_steps = round(t_final / Ts);
 
-% Preallocate
 t_sim = (0:N_steps) * Ts;
 x_hist = zeros(nx, N_steps+1);
 u_hist = zeros(nu, N_steps);
@@ -246,16 +235,12 @@ for k = 1:N_steps
     X_ref_global_hist(k) = X_ref_global;
     Y_ref_global_hist(k) = Y_ref_global;
 
-    % Track heading and velocity only, and let the path following
-    % happen from correct heading + velocity
-
     % Desired heading: follow path tangent
     psi_ref = atan2(dY_ref_global, dX_ref_global);
 
     % Desired velocity: match path velocity
     v_ref_global = sqrt(dX_ref_global^2 + dY_ref_global^2);
 
-    % Construct reference: NO position tracking, just heading + velocity
     % Reference: [x, theta, psi, dx, dtheta, dpsi]
     x_ref = [0, 0, psi_ref, v_ref_global, 0, 0];
     x_ref_hist(:, k) = x_ref';
@@ -282,7 +267,7 @@ for k = 1:N_steps
 
     x_hist(:, k+1) = x_next;
 
-    % Update global position (integrate velocity)
+    % Update global position
     X_global_hist(k+1) = X_global_hist(k) + Ts * x_next(4) * cos(x_next(3));
     Y_global_hist(k+1) = Y_global_hist(k) + Ts * x_next(4) * sin(x_next(3));
 
@@ -312,24 +297,9 @@ Y_global = Y_global_hist';
 X_ref_global = X_ref_global_hist';
 Y_ref_global = Y_ref_global_hist';
 
-z_cm = r + l*cos(theta);
-z_tip = r + L_body*cos(theta);
-
-%% Performance metrics
 error_X_global = X_global - X_ref_global;
 error_Y_global = Y_global - Y_ref_global;
 error_distance = sqrt(error_X_global.^2 + error_Y_global.^2);
-
-fprintf('\n--- Global Path Following Performance ---\n');
-fprintf('Position tracking error:\n');
-fprintf('  RMS distance error: %.4f m\n', sqrt(mean(error_distance.^2)));
-fprintf('  Max distance error: %.4f m\n', max(error_distance));
-fprintf('  Mean distance error: %.4f m\n', mean(error_distance));
-fprintf('\nControl effort:\n');
-fprintf('  Max torque: %.2f Nm\n', max(abs(u_hist(:))));
-fprintf('  Mean torque: %.2f Nm\n', mean(abs(u_hist(:))));
-fprintf('\nStability:\n');
-fprintf('  Max pitch angle: %.2f deg\n', rad2deg(max(abs(theta))));
 
 %% Plotting
 figure('Position', [100, 100, 1400, 900], 'Color', 'w');
@@ -398,17 +368,17 @@ legend('$\tau_L$', '$\tau_R$', 'Location', 'best', 'FontSize', 12);
 grid on;
 set(gca, 'FontSize', 12);
 
-% sgtitle('NMPC-Based Global Path Following', 'FontSize', 18, 'FontWeight', 'bold');
+sgtitle('NMPC-Based Global Path Following', 'FontSize', 18, 'FontWeight', 'bold');
 
-%% Helper functions (same as before)
 function x_next = segway_discrete_dynamics(x, u, Ts, params)
     dx_dt = segway_dynamics_continuous(x, u, params);
+
+    % Euler step
     x_next = x + Ts * dx_dt;
 end
 
 function dx_dt = segway_dynamics_continuous(x, u, params)
     theta = x(2);
-    psi = x(3);
     dx = x(4);
     dtheta = x(5);
     dpsi = x(6);
