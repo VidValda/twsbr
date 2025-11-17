@@ -12,7 +12,16 @@ The controllers implemented are:
 
 ### OpenModelica
 
-WIP
+Open Modelica is used for several experiments and the models of the system. The files are distributed as.
+
+- `SegwaySystem.mo` is the document that holds all the components together and the one on which the experiments where made.
+- `SegwayDynamics.mo` contains the dynamics of the system, you can change parameters of the model, initial statesand disturbances. As input, it accepts torque and as output the state systems.
+- `LQRController.mo` is the controller, you can set the offline gains, max absolute torque of the motors. As input tou have the feedback, the setpoints and as output the torques.
+- `NoiseMatrix.mo` is the component that add a drift noise to the model.
+
+To run the code, load the four codes into open modelica and simulate `SegwaySystem.mo`.
+
+For getting new LQR gains, use the matlab file `calculate_lqr_gains.m`, this gets the optimal k_gains to put basde
 
 ### MATLAB
 
